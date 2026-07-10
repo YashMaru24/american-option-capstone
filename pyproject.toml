@@ -1,0 +1,8 @@
+[project]
+name = "american-option-capstone"
+version = "0.1.0"
+description = "CRR binomial, NN, and RL pricing/policy comparison for American puts."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+seed: 42
+episodes: 5000
+gamma: 1.0
+learning_rate: 0.001
+epsilon_start: 1.0
+epsilon_end: 0.05
+epsilon_decay: 0.995
+replay_buffer_size: 10000
+batch_size: 64
+target_update_freq: 100
+hidden_layer_sizes: [64, 64]
+checkpoint_path: models/dqn_policy.pt
