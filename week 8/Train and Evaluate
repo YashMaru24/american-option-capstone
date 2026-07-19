@@ -1,0 +1,208 @@
+"""
+Week 8 — Train and evaluate an RL stopping policy for the American put.
+
+Pipeline:
+ 1. Reuse Week 7's AmericanPutEnv (env.py) unchanged.
+ 2. Train a NumPy DQN (dqn.py: replay buffer + target network + Double DQN).
+ 3. Evaluate always-hold, immediate-exercise, random, and the learned DQN
+    policy over 5000+ episodes each.
+ 4. Price the same contract with a CRR binomial tree (binomial.py) as the
+    Week 4 benchmark and compare.
+ 5. Plot the learned exercise region against the binomial exercise boundary.
+ 6. Re-train with 3 seeds to report sensitivity/instability.
+
+Run:  python train_and_evaluate.py
+"""
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+from env import AmericanPutEnv, OptionParams, HOLD, EXERCISE
+from dqn import train_dqn, dqn_policy_factory
+from binomial import crr_american_put
+
+SEED = 0
+N_EVAL = 6000  # >= 5000 required by the assignment
+
+
+# ----------------------------------------------------------------------
+# Baseline policies (same as Week 7)
+# ----------------------------------------------------------------------
+
+def policy_hold_to_expiry(obs, env, rng):
+    return HOLD
+
+
+def policy_immediate_exercise(obs, env, rng):
+    return EXERCISE
+
+
+def policy_random(obs, env, rng, p_exercise=0.05):
+    return EXERCISE if rng.random() < p_exercise else HOLD
+
+
+def evaluate_policy(policy_fn, n_episodes, seed, params):
+    env = AmericanPutEnv(params=params, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    disc_payoffs, raw_payoffs, exercised, ex_times = [], [], 0, []
+    for ep in range(n_episodes):
+        obs = env.reset(seed=seed + 1000 + ep)
+        done = False
+        while not done:
+            a = policy_fn(obs, env, rng)
+            obs, reward, done, info = env.step(a)
+        disc_payoffs.append(info["discounted_payoff"])
+        raw_payoffs.append(reward)
+        if info["reason"] == "exercised":
+            exercised += 1
+            ex_times.append(info["exercise_time"])
+    return {
+        "avg_discounted_payoff": float(np.mean(disc_payoffs)),
+        "se_discounted_payoff": float(np.std(disc_payoffs) / np.sqrt(n_episodes)),
+        "avg_raw_payoff": float(np.mean(raw_payoffs)),
+        "exercise_rate": exercised / n_episodes,
+        "avg_exercise_step": float(np.mean(ex_times)) if ex_times else float("nan"),
+        "exercise_times": ex_times,
+    }
+
+
+if __name__ == "__main__":
+    params = OptionParams()  # S0=100, K=100, r=3%, sigma=20%, T=1, N=50
+
+    print("=" * 74)
+    print("PART A — CONTRACT / TRAINING SETUP")
+    print("=" * 74)
+    print(f"Contract:  S0={params.S0}  K={params.K}  T={params.T}yr  "
+          f"r={params.r:.2%}  sigma={params.sigma:.2%}  N={params.N} steps "
+          f"(dt={params.T/params.N:.4f}yr)")
+    print("State features: (moneyness S_t/K, time-remaining fraction (N-t)/N) "
+          "— current information only, no future prices (see env.py docstring).")
+
+    DQN_HPARAMS = dict(
+        n_episodes=15000, lr=1e-3, batch_size=64, buffer_capacity=50_000,
+        train_every=4, target_sync_every=300, min_buffer=500,
+        eps_start=1.0, eps_end=0.05, eps_decay_frac=0.6,
+        hidden=64, reward_scale=10.0, double_dqn=True, seed=SEED,
+    )
+    print("\nDQN hyperparameters:")
+    for k, v in DQN_HPARAMS.items():
+        print(f"    {k:18s} = {v}")
+
+    print("\nTraining DQN (main seed = {})...".format(SEED))
+    t0 = time.time()
+    net, log = train_dqn(lambda: AmericanPutEnv(params, seed=params.seed),
+                          verbose_every=3000, **DQN_HPARAMS)
+    print(f"Training time: {time.time()-t0:.1f}s")
+
+    # ---- training curve ----
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    returns = np.array(log["ep_returns"])
+    window = 200
+    smooth = np.convolve(returns, np.ones(window) / window, mode="valid")
+    ax.plot(returns, alpha=0.25, color="#3b6ea5", label="episode return")
+    ax.plot(np.arange(window - 1, len(returns)), smooth, color="#a53b3b",
+             label=f"{window}-episode moving average")
+    ax.set_xlabel("training episode")
+    ax.set_ylabel("discounted episode return (eps-greedy)")
+    ax.set_title("DQN training curve (main seed)")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("training_curve.png", dpi=150)
+    print("Saved training_curve.png")
+
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 74)
+    print(f"PART B — POLICY EVALUATION ({N_EVAL} episodes each)")
+    print("=" * 74)
+
+    dqn_policy = dqn_policy_factory(net)
+    results = {}
+    results["always_hold_to_expiry"] = evaluate_policy(policy_hold_to_expiry, N_EVAL, 100, params)
+    results["immediate_exercise"] = evaluate_policy(policy_immediate_exercise, N_EVAL, 200, params)
+    results["random"] = evaluate_policy(policy_random, N_EVAL, 300, params)
+    results["learned_dqn"] = evaluate_policy(dqn_policy, N_EVAL, 400, params)
+
+    binom_price, binom_boundary = crr_american_put(
+        S0=params.S0, K=params.K, r=params.r, sigma=params.sigma, T=params.T, N=params.N)
+
+    print(f"\nCRR binomial American put price (Week 4 benchmark): {binom_price:.4f}\n")
+    print(f"{'Policy':<24}{'AvgDiscPayoff':>15}{'StdErr':>10}{'ExerciseRate':>15}"
+          f"{'AvgExStep':>12}{'%ofBinomial':>13}")
+    for name, r in results.items():
+        pct = 100 * r["avg_discounted_payoff"] / binom_price
+        print(f"{name:<24}{r['avg_discounted_payoff']:>15.4f}{r['se_discounted_payoff']:>10.4f}"
+              f"{r['exercise_rate']:>15.2%}{r['avg_exercise_step']:>12.2f}{pct:>12.1f}%")
+
+    if results["learned_dqn"]["avg_discounted_payoff"] > binom_price * 1.02:
+        print("\n*** WARNING: learned policy exceeds the binomial benchmark by >2% — "
+              "this should not happen for a correctly specified stopping problem; "
+              "investigate for lookahead leakage or reward double-counting before trusting it. ***")
+    else:
+        print("\nSanity check OK: learned policy does not exceed the binomial benchmark.")
+
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 74)
+    print("PART B.5 — EXERCISE REGION: learned policy vs. binomial boundary")
+    print("=" * 74)
+
+    m_grid = np.linspace(0.5, 1.3, 161)
+    tau_grid = np.linspace(1.0 / params.N, 1.0, params.N)
+    learned_boundary = np.full(len(tau_grid), np.nan)
+    for j, tau in enumerate(tau_grid):
+        obs_batch = np.stack([m_grid, np.full_like(m_grid, tau)], axis=1)
+        q = net.forward(obs_batch)
+        exercise_pref = q[:, EXERCISE] > q[:, HOLD]
+        if exercise_pref.any():
+            learned_boundary[j] = m_grid[exercise_pref].max()
+
+    binom_steps = np.arange(params.N + 1)
+    binom_tau = (params.N - binom_steps) / params.N
+    binom_moneyness = binom_boundary / params.K
+
+    fig2, ax2 = plt.subplots(figsize=(7, 5))
+    ax2.plot(tau_grid, learned_boundary, "o-", color="#a53b3b", markersize=3,
+              label="learned (DQN) exercise boundary")
+    ax2.plot(binom_tau, binom_moneyness, "-", color="#333333", linewidth=2,
+              label="binomial (Week 4) exercise boundary")
+    ax2.axhline(1.0, color="gray", linestyle="--", linewidth=1, label="moneyness = 1 (ATM)")
+    ax2.set_xlabel("time remaining (fraction of T)")
+    ax2.set_ylabel("moneyness S/K below which EXERCISE is preferred")
+    ax2.set_title("Early-exercise region: learned policy vs. binomial benchmark")
+    ax2.legend(fontsize=9)
+    ax2.set_ylim(0.5, 1.1)
+    plt.tight_layout()
+    plt.savefig("exercise_region_comparison.png", dpi=150)
+    print("Saved exercise_region_comparison.png")
+
+    # table version (every 5th step) for the report
+    print("\ntau (frac remaining)   learned boundary (S/K)   binomial boundary (S/K)")
+    for j in range(0, len(tau_grid), 5):
+        lb = learned_boundary[j]
+        # nearest binomial tau
+        bj = np.argmin(np.abs(binom_tau - tau_grid[j]))
+        print(f"{tau_grid[j]:>18.3f}   {lb if not np.isnan(lb) else float('nan'):>20.3f}"
+              f"   {binom_moneyness[bj]:>22.3f}")
+
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 74)
+    print("PART C.4 — SEED SENSITIVITY (3 additional training seeds)")
+    print("=" * 74)
+    seed_results = {}
+    for s in [0, 1, 2]:
+        hp = dict(DQN_HPARAMS)
+        hp["seed"] = s
+        hp["n_episodes"] = 10000  # shorter run per seed to keep total time reasonable
+        net_s, log_s = train_dqn(lambda: AmericanPutEnv(params, seed=params.seed),
+                                  verbose_every=0, **hp)
+        pol_s = dqn_policy_factory(net_s)
+        res_s = evaluate_policy(pol_s, 2000, 900 + s, params)
+        seed_results[s] = res_s["avg_discounted_payoff"]
+        print(f"  seed {s}: avg discounted payoff = {res_s['avg_discounted_payoff']:.4f}  "
+              f"(exercise rate {res_s['exercise_rate']:.1%})")
+
+    vals = list(seed_results.values())
+    print(f"\nAcross seeds: mean={np.mean(vals):.4f}  std={np.std(vals):.4f}  "
+          f"range=[{min(vals):.4f}, {max(vals):.4f}]  "
+          f"(binomial benchmark = {binom_price:.4f})")
+
+    print("\nDone. All figures saved to the working directory.")
