@@ -1,0 +1,425 @@
+"""
+Week 7 — American Put RL Environment
+=====================================
+
+Defines the American put early-exercise problem as a Markov Decision Process,
+implements a small Gym-style environment, tests its reward/terminal logic,
+and compares three baseline policies (always-hold, immediate-exercise, random).
+
+Run:
+    python american_put_env.py
+
+Requires: numpy, matplotlib (both already installed)
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+# ----------------------------------------------------------------------
+# Part A / B — MDP + Environment
+# ----------------------------------------------------------------------
+
+HOLD = 0
+EXERCISE = 1
+
+
+@dataclass
+class OptionParams:
+    S0: float = 100.0      # initial underlying price
+    K: float = 100.0       # strike
+    r: float = 0.03        # risk-free rate (annualized, continuous comp.)
+    sigma: float = 0.20    # volatility (annualized)
+    T: float = 1.0         # time to maturity (years)
+    N: int = 50            # number of discrete decision steps
+    seed: int = 7          # default RNG seed for reproducibility
+
+
+class AmericanPutEnv:
+    """
+    A discrete-time, single-asset American put environment.
+
+    MDP definition (Part A)
+    ------------------------
+    STATE  s_t = (m_t, tau_t) where
+        m_t   = S_t / K                  (moneyness, current price only)
+        tau_t = (N - t) / N               (fraction of time remaining)
+    Only the *current* price and *current* time step are exposed. No past
+    prices, no future prices, no path statistics (max/min so far, etc.) are
+    included, so the agent cannot see anything that has not already been
+    realized. Because the underlying is simulated as a (risk-neutral)
+    Markov process (GBM discretized on a lattice of time steps), (S_t, t)
+    is a *sufficient statistic* for the option value at time t — nothing
+    is lost by hiding the path.
+
+    ACTIONS  a_t in {HOLD=0, EXERCISE=1}
+        HOLD: the agent keeps the option alive; the environment advances
+              the clock and draws the next price.
+        EXERCISE: the agent stops the episode immediately and receives the
+              intrinsic payoff max(K - S_t, 0).
+
+    TRANSITIONS
+        After HOLD (t < N-1):        S_{t+1} ~ risk-neutral one-step model,
+                                      t -> t+1, episode continues.
+        After HOLD (t == N-1):       one final price draw to S_N, episode
+                                      is force-terminated at maturity with
+                                      payoff max(K - S_N, 0)  (an American
+                                      option that is still alive at expiry
+                                      is exercised iff it's in the money —
+                                      this mirrors European payoff at T).
+        After EXERCISE (any t):      episode terminates immediately, payoff
+                                      max(K - S_t, 0) using the price the
+                                      agent observed when it acted.
+
+    REWARD / DISCOUNTING
+        The reward is 0 on every HOLD step and equals the intrinsic payoff
+        exactly once, on the step that ends the episode (exercise or
+        forced expiry). No reward is ever paid twice and none is paid
+        while holding, matching the actual cash flow of a real American
+        put: you receive money only at the moment you exercise (or at
+        expiry). Discounting uses gamma = exp(-r * dt) per decision step
+        (dt = T/N), the discrete risk-neutral discount factor, so that the
+        RL discounted return  G_0 = sum_t gamma^t r_t  equals the
+        discounted expected payoff used in Week 4's option-pricing
+        boundary conditions. We keep raw (undiscounted) payoff in the
+        `reward` field returned by step() and additionally expose the
+        properly-discounted payoff in `info['discounted_payoff']`, so the
+        environment is transparent about both the cash amount and its
+        present value.
+
+    NO LEAKAGE (Part A.5)
+        The price path is simulated one step at a time, *inside* step(),
+        using only the RNG state and the current price — the future
+        trajectory does not exist yet when the agent chooses an action.
+        The state handed to the agent is built strictly from information
+        available at or before time t. This is why we did not, e.g.,
+        include "price at maturity" or "maximum future price" as
+        features — those would not be observable in a real trade and
+        would let a policy "look ahead" to trivially maximize payoff.
+    """
+
+    def __init__(self, params: OptionParams = None, seed: int = None):
+        self.p = params if params is not None else OptionParams()
+        self.dt = self.p.T / self.p.N
+        self.gamma = np.exp(-self.p.r * self.dt)
+        self._rng = np.random.default_rng(seed if seed is not None else self.p.seed)
+        self.t = 0
+        self.S = self.p.S0
+        self.done = True  # must call reset() before step()
+
+    # -- helpers ---------------------------------------------------------
+    def _obs(self):
+        m = self.S / self.p.K
+        tau = (self.p.N - self.t) / self.p.N
+        return np.array([m, tau], dtype=np.float64)
+
+    def _payoff(self, S):
+        return max(self.p.K - S, 0.0)
+
+    def _simulate_next_price(self, S):
+        """Risk-neutral GBM, one Euler step (log-normal, exact for GBM)."""
+        z = self._rng.standard_normal()
+        drift = (self.p.r - 0.5 * self.p.sigma ** 2) * self.dt
+        diffusion = self.p.sigma * np.sqrt(self.dt) * z
+        return S * np.exp(drift + diffusion)
+
+    # -- public API --------------------------------------------------------
+    def reset(self, seed: int = None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self.t = 0
+        self.S = self.p.S0
+        self.done = False
+        return self._obs()
+
+    def step(self, action: int):
+        if self.done:
+            raise RuntimeError(
+                "step() called after episode terminated — call reset() first."
+            )
+        if action not in (HOLD, EXERCISE):
+            raise ValueError(f"Unknown action {action}; use HOLD=0 or EXERCISE=1")
+
+        if action == EXERCISE:
+            payoff = self._payoff(self.S)
+            self.done = True
+            info = {
+                "reason": "exercised",
+                "exercise_time": self.t,
+                "price_at_exercise": self.S,
+                "discounted_payoff": payoff * (self.gamma ** self.t),
+            }
+            return self._obs(), payoff, True, info
+
+        # action == HOLD
+        if self.t >= self.p.N - 1:
+            # one last price draw, then forced settlement at maturity
+            self.S = self._simulate_next_price(self.S)
+            self.t += 1
+            payoff = self._payoff(self.S)
+            self.done = True
+            info = {
+                "reason": "expired",
+                "exercise_time": self.t,
+                "price_at_exercise": self.S,
+                "discounted_payoff": payoff * (self.gamma ** self.t),
+            }
+            return self._obs(), payoff, True, info
+        else:
+            self.S = self._simulate_next_price(self.S)
+            self.t += 1
+            info = {"reason": "hold"}
+            return self._obs(), 0.0, False, info
+
+
+# ----------------------------------------------------------------------
+# Part B.4 — environment tests
+# ----------------------------------------------------------------------
+
+def test_nonnegative_payoff(n_episodes=200, seed=123):
+    """Payoff must never be negative, whatever the action sequence."""
+    env = AmericanPutEnv(seed=seed)
+    rng = np.random.default_rng(seed)
+    for ep in range(n_episodes):
+        env.reset(seed=seed + ep)
+        done = False
+        while not done:
+            a = rng.integers(0, 2)  # random hold/exercise
+            _, reward, done, _ = env.step(a)
+            assert reward >= 0.0, f"Negative payoff {reward} found!"
+    print(f"[PASS] test_nonnegative_payoff over {n_episodes} random-policy episodes")
+
+
+def test_cannot_step_after_done():
+    """step() after termination must raise, never silently continue."""
+    env = AmericanPutEnv(seed=1)
+    env.reset()
+    _, _, done, _ = env.step(EXERCISE)
+    assert done is True
+    try:
+        env.step(HOLD)
+        raise AssertionError("step() after done did not raise!")
+    except RuntimeError:
+        print("[PASS] test_cannot_step_after_done (RuntimeError correctly raised)")
+
+
+def test_single_payment_and_termination_on_expiry():
+    """Reward must be 0 on every hold step; episode must end exactly at t=N
+    if the agent never exercises early."""
+    env = AmericanPutEnv(seed=42)
+    env.reset()
+    done = False
+    steps = 0
+    total_reward = 0.0
+    n_nonzero_rewards = 0
+    while not done:
+        _, reward, done, info = env.step(HOLD)
+        steps += 1
+        total_reward += reward
+        if reward > 0:
+            n_nonzero_rewards += 1
+    assert steps == env.p.N, f"Expected {env.p.N} steps to expiry, got {steps}"
+    assert n_nonzero_rewards <= 1, "Reward paid more than once!"
+    print("[PASS] test_single_payment_and_termination_on_expiry "
+          f"(steps={steps}, total_reward={total_reward:.4f})")
+
+
+# ----------------------------------------------------------------------
+# Part B.5 — five sample episodes
+# ----------------------------------------------------------------------
+
+def run_sample_episodes(n=5, policy_name="random", seed=2024):
+    print(f"\nSample episodes under a '{policy_name}' policy:")
+    env = AmericanPutEnv(seed=seed)
+    rng = np.random.default_rng(seed)
+    for ep in range(n):
+        obs = env.reset(seed=seed + ep)
+        done = False
+        while not done:
+            if policy_name == "random":
+                a = rng.integers(0, 2)
+            elif policy_name == "hold":
+                a = HOLD
+            else:
+                raise ValueError(policy_name)
+            obs, reward, done, info = env.step(a)
+        print(f"  ep {ep}: reason={info['reason']:9s}  t={info['exercise_time']:2d}"
+              f"  S={info['price_at_exercise']:6.2f}  payoff={reward:6.3f}"
+              f"  discounted={info['discounted_payoff']:6.3f}")
+
+
+# ----------------------------------------------------------------------
+# Part C — Policy comparison
+# ----------------------------------------------------------------------
+
+def policy_hold_to_expiry(obs, env, rng):
+    return HOLD
+
+
+def policy_immediate_exercise(obs, env, rng):
+    return EXERCISE
+
+
+def policy_random(obs, env, rng, p_exercise=0.05):
+    # small per-step probability of exercising keeps random episodes from
+    # being trivially dominated by always-expire behaviour
+    return EXERCISE if rng.random() < p_exercise else HOLD
+
+
+def evaluate_policy(policy_fn, n_episodes=1000, seed=99, params: OptionParams = None):
+    env = AmericanPutEnv(params=params, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    payoffs = []
+    disc_payoffs = []
+    exercised_early = 0
+    exercise_times = []
+    for ep in range(n_episodes):
+        obs = env.reset(seed=seed + 1000 + ep)
+        done = False
+        while not done:
+            a = policy_fn(obs, env, rng)
+            obs, reward, done, info = env.step(a)
+        payoffs.append(reward)
+        disc_payoffs.append(info["discounted_payoff"])
+        if info["reason"] == "exercised":
+            exercised_early += 1
+            exercise_times.append(info["exercise_time"])
+    return {
+        "avg_payoff": float(np.mean(payoffs)),
+        "avg_discounted_payoff": float(np.mean(disc_payoffs)),
+        "std_discounted_payoff": float(np.std(disc_payoffs)),
+        "exercise_rate": exercised_early / n_episodes,
+        "exercise_times": exercise_times,
+    }
+
+
+# ----------------------------------------------------------------------
+# Part C.4 (optional) — tabular Q-learning sketch
+# ----------------------------------------------------------------------
+
+def discretize(obs, m_bins, tau_bins):
+    m, tau = obs
+    m_idx = np.clip(np.digitize(m, m_bins) - 1, 0, len(m_bins) - 2)
+    tau_idx = np.clip(np.digitize(tau, tau_bins) - 1, 0, len(tau_bins) - 2)
+    return int(m_idx), int(tau_idx)
+
+
+def train_tabular_q(n_episodes=20000, seed=11, params: OptionParams = None,
+                     alpha=0.1, epsilon_start=1.0, epsilon_end=0.05):
+    env = AmericanPutEnv(params=params, seed=seed)
+    rng = np.random.default_rng(seed)
+    m_bins = np.linspace(0.5, 1.5, 21)     # moneyness bins
+    tau_bins = np.linspace(0.0, 1.0, 21)   # time-remaining bins
+    Q = defaultdict(lambda: np.zeros(2))
+
+    for ep in range(n_episodes):
+        eps = max(epsilon_end, epsilon_start * (1 - ep / n_episodes))
+        obs = env.reset(seed=seed + 5000 + ep)
+        s = discretize(obs, m_bins, tau_bins)
+        done = False
+        while not done:
+            if rng.random() < eps:
+                a = rng.integers(0, 2)
+            else:
+                a = int(np.argmax(Q[s]))
+            obs2, reward, done, info = env.step(a)
+            s2 = discretize(obs2, m_bins, tau_bins)
+            target = reward if done else reward + env.gamma * np.max(Q[s2])
+            Q[s][a] += alpha * (target - Q[s][a])
+            s = s2
+    return Q, m_bins, tau_bins, env
+
+
+def q_policy_factory(Q, m_bins, tau_bins):
+    def policy(obs, env, rng):
+        s = discretize(obs, m_bins, tau_bins)
+        return int(np.argmax(Q[s]))
+    return policy
+
+
+def exercise_region_from_Q(Q, m_bins, tau_bins):
+    """Return, for each tau bin, the largest moneyness at which EXERCISE
+    is preferred (an approximation of the early-exercise boundary)."""
+    m_mid = 0.5 * (m_bins[:-1] + m_bins[1:])
+    tau_mid = 0.5 * (tau_bins[:-1] + tau_bins[1:])
+    boundary = []
+    for tj in range(len(tau_mid)):
+        exercise_m = [m_mid[mi] for mi in range(len(m_mid))
+                      if Q[(mi, tj)][EXERCISE] > Q[(mi, tj)][HOLD]]
+        boundary.append(max(exercise_m) if exercise_m else np.nan)
+    return tau_mid, np.array(boundary)
+
+
+# ----------------------------------------------------------------------
+# Main script — runs everything and saves plots
+# ----------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("PART B — ENVIRONMENT TESTS")
+    print("=" * 70)
+    test_nonnegative_payoff()
+    test_cannot_step_after_done()
+    test_single_payment_and_termination_on_expiry()
+
+    run_sample_episodes(n=5, policy_name="random", seed=2024)
+
+    print("\n" + "=" * 70)
+    print("PART C — POLICY COMPARISON (1000 episodes each)")
+    print("=" * 70)
+
+    params = OptionParams()
+    N_EVAL = 1000
+    results = {}
+    results["always_hold_to_expiry"] = evaluate_policy(
+        policy_hold_to_expiry, n_episodes=N_EVAL, seed=100, params=params)
+    results["immediate_exercise"] = evaluate_policy(
+        policy_immediate_exercise, n_episodes=N_EVAL, seed=200, params=params)
+    results["random"] = evaluate_policy(
+        policy_random, n_episodes=N_EVAL, seed=300, params=params)
+
+    print(f"\n{'Policy':<22}{'AvgPayoff':>12}{'AvgDiscPayoff':>16}"
+          f"{'StdDiscPayoff':>16}{'ExerciseRate':>15}")
+    for name, r in results.items():
+        print(f"{name:<22}{r['avg_payoff']:>12.4f}{r['avg_discounted_payoff']:>16.4f}"
+              f"{r['std_discounted_payoff']:>16.4f}{r['exercise_rate']:>15.2%}")
+
+    # ---- plot: histogram of exercise times for the nontrivial policies ----
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, name in zip(axes, ["immediate_exercise", "random"]):
+        times = results[name]["exercise_times"]
+        if len(times) > 0:
+            ax.hist(times, bins=range(0, params.N + 2), color="#3b6ea5", edgecolor="white")
+        ax.set_title(f"Exercise-time histogram: {name}")
+        ax.set_xlabel("time step of exercise")
+        ax.set_ylabel("count")
+    plt.tight_layout()
+    plt.savefig("exercise_time_histograms.png", dpi=150)
+    print("\nSaved exercise_time_histograms.png")
+
+    # ---- optional Part C.4: tabular Q-learning ----
+    print("\n" + "=" * 70)
+    print("PART C.4 (optional) — TABULAR Q-LEARNING")
+    print("=" * 70)
+    Q, m_bins, tau_bins, _ = train_tabular_q(n_episodes=20000, seed=11, params=params)
+    q_policy = q_policy_factory(Q, m_bins, tau_bins)
+    q_results = evaluate_policy(q_policy, n_episodes=N_EVAL, seed=400, params=params)
+    print(f"{'q_learned':<22}{q_results['avg_payoff']:>12.4f}"
+          f"{q_results['avg_discounted_payoff']:>16.4f}"
+          f"{q_results['std_discounted_payoff']:>16.4f}"
+          f"{q_results['exercise_rate']:>15.2%}")
+
+    tau_mid, boundary = exercise_region_from_Q(Q, m_bins, tau_bins)
+    fig2, ax2 = plt.subplots(figsize=(6, 4.5))
+    ax2.plot(tau_mid, boundary, marker="o", color="#a53b3b")
+    ax2.axhline(1.0, color="gray", linestyle="--", linewidth=1, label="moneyness = 1 (ATM)")
+    ax2.set_xlabel("time remaining (fraction of T)")
+    ax2.set_ylabel("moneyness boundary (S/K) below which Q says EXERCISE")
+    ax2.set_title("Learned early-exercise boundary (tabular Q-learning)")
+    ax2.legend()
+    plt.tight_layout()
+    plt.savefig("learned_exercise_boundary.png", dpi=150)
+    print("Saved learned_exercise_boundary.png")
+
+    print("\nDone.")
