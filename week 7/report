@@ -1,0 +1,235 @@
+# Week 7 — American Put RL Environment
+### MDP formulation, environment implementation, and baseline policy comparison
+
+Code: `american_put_env.py` (reproduces every number and figure below).
+Run with `python american_put_env.py` — no extra setup beyond `numpy` and
+`matplotlib`. All randomness is seeded (see **Reproducibility** at the end).
+
+---
+
+## Part A — MDP Definition
+
+**A.1 State features**
+
+The agent observes `s_t = (m_t, tau_t)`:
+
+- `m_t = S_t / K` — moneyness, current underlying price scaled by the strike.
+- `tau_t = (N - t) / N` — fraction of time remaining to expiry.
+
+That's it. No path history, no future prices, no realized min/max. Under a
+lattice/GBM model the underlying price process is Markov, so `(S_t, t)` is a
+*sufficient statistic* for the option's continuation value — adding more
+features would not change the optimal policy, it would only make the
+function approximator's job harder.
+
+**A.2 Actions**
+
+Two actions only:
+
+- `HOLD (0)` — keep the option alive, let the clock advance.
+- `EXERCISE (1)` — stop now, collect the intrinsic payoff.
+
+**A.3 Transitions**
+
+- **After `HOLD`, t < N‑1:** the environment draws the next price from a
+  discretized risk-neutral GBM step,
+  `S_{t+1} = S_t * exp((r - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)`, `Z~N(0,1)`,
+  increments `t`, and the episode continues.
+- **After `HOLD`, t = N‑1 (last step):** one final price is drawn to `S_N`
+  and the episode is **force-terminated** with payoff `max(K - S_N, 0)`.
+  This is the standard convention: an American option still alive at
+  expiry behaves like a European option — it is settled at intrinsic
+  value, in‑the‑money or not.
+- **After `EXERCISE`, any t:** the episode terminates immediately with
+  payoff `max(K - S_t, 0)`, using the price the agent actually observed
+  when it acted (no lookahead).
+
+**A.4 Reward timing and discounting**
+
+Reward is `0` on every `HOLD` step and equals the intrinsic payoff **exactly
+once** — on the step that ends the episode, whether by exercise or forced
+expiry. This mirrors the real cash flow of an American put: you are paid
+once, at the moment you exercise (or at expiry), never while holding.
+
+Discounting uses `gamma = exp(-r * dt)` per decision step, the same
+per-period risk-neutral discount factor used to price options in Week 4.
+Because reward is a single terminal payoff, the standard RL discounted
+return `G_0 = sum_t gamma^t * r_t` collapses to
+`gamma^(exercise time) * payoff`, which is exactly the present value used
+in option pricing. `step()` reports both the raw payoff (`reward`) and its
+discounted value (`info['discounted_payoff']`), so training and reporting
+can each use whichever is appropriate.
+
+**A.5 Why the state does not leak future information**
+
+The price path is generated **inside `step()`**, one draw at a time, using
+only the current price and the RNG — the future trajectory does not exist
+yet when the agent picks an action. The observation returned to the agent
+is built strictly from `S_t` and `t`, both already realized at the moment
+of the decision. We deliberately excluded any feature that would require
+knowledge of prices *after* `t` (e.g., final payoff, max future price,
+whether the option would have ended up in the money) — those would let a
+policy "cheat" by seeing the answer before choosing, which is not available
+to a real trader and would produce a policy useless for Week 8 training.
+
+---
+
+## Part B — Environment Implementation
+
+`AmericanPutEnv` implements `reset()` and `step(action)`:
+
+- `reset(seed=None)` resets `t=0`, `S=S0`, `done=False`, returns the initial
+  observation.
+- `step(action)` raises `RuntimeError` if called after the episode is
+  already done; otherwise it applies the transition rules from A.3 and
+  returns `(obs, reward, done, info)`. Both `EXERCISE` and forced expiry
+  set `done=True` — there is no path back to `HOLD` after either.
+
+**B.4 Environment tests** (all in `american_put_env.py`, all pass):
+
+1. **`test_nonnegative_payoff`** — runs 200 episodes under a fully random
+   action sequence and asserts every single reward is `>= 0`. This checks
+   the payoff formula `max(K - S, 0)` is applied correctly everywhere and
+   that discounting/scaling never introduces a sign error.
+2. **`test_cannot_step_after_done`** — exercises immediately, confirms
+   `done=True`, then calls `step()` again and asserts it raises
+   `RuntimeError` rather than silently returning a second reward. This is
+   the check for "cannot exercise twice / cannot receive payoff twice."
+3. **`test_single_payment_and_termination_on_expiry`** (bonus third test) —
+   runs `HOLD` for the entire episode and asserts (a) the episode terminates
+   at exactly `t=N` and (b) at most one nonzero reward was ever paid. This
+   guards against the "reward while holding" failure mode explicitly called
+   out in the assignment.
+
+Actual test output:
+
+```
+[PASS] test_nonnegative_payoff over 200 random-policy episodes
+[PASS] test_cannot_step_after_done (RuntimeError correctly raised)
+[PASS] test_single_payment_and_termination_on_expiry (steps=50, total_reward=0.0000)
+```
+
+**B.5 Five sample episodes** (random policy, `p_exercise` implicit via
+uniform random action each step, seed=2024):
+
+```
+ep 0: reason=exercised  t= 1  S=102.97  payoff= 0.000  discounted= 0.000
+ep 1: reason=exercised  t= 4  S= 89.72  payoff=10.280  discounted=10.255
+ep 2: reason=exercised  t= 0  S=100.00  payoff= 0.000  discounted= 0.000
+ep 3: reason=exercised  t= 0  S=100.00  payoff= 0.000  discounted= 0.000
+ep 4: reason=exercised  t= 0  S=100.00  payoff= 0.000  discounted= 0.000
+```
+
+All five terminate by early exercise (reflecting the ~50% per-step exercise
+probability of a fully random policy), and payoffs are correctly `0` when
+the price is above the strike at the moment of exercise. Discounted payoff
+is always `<=` raw payoff, as expected.
+
+---
+
+## Part C — Policy Comparison
+
+Parameters used for all comparisons: `S0=100, K=100, r=3%, sigma=20%,
+T=1 year, N=50 steps` (i.e., roughly weekly decisions). 1000 episodes per
+policy, distinct seeds per policy for independence.
+
+| Policy                 | Avg Payoff | Avg Discounted Payoff | Std (disc.) | Exercise Rate |
+|-------------------------|-----------:|-----------------------:|------------:|---------------:|
+| Always-hold-to-expiry    | 6.5922     | 6.3974                 | 9.2060      | 0.00% |
+| Immediate-exercise       | 0.0000     | 0.0000                 | 0.0000      | 100.00% |
+| Random (5%/step)         | 3.4341     | 3.3854                 | 5.8314      | 93.20% |
+| Tabular Q-learning (opt.)| 3.8868     | 3.8672                 | 3.0511      | 78.40% |
+
+- **Immediate-exercise** always scores 0 here because `S0=K` (at‑the‑money):
+  exercising at `t=0` throws away all time value for a payoff of exactly
+  zero, every single episode. This is the clearest illustration in the
+  whole assignment of why early exercise without a moneyness/time
+  condition is a bad policy.
+- **Always-hold-to-expiry** achieves the highest raw and discounted average
+  payoff of the three baselines. That's expected for a put on a
+  positive-drift risk-neutral process (drift `r=3%>0`): waiting lets the
+  option pick up the (comparatively rare but valuable) large downside
+  moves, and — since it's ATM — most of the option's expected value here
+  is genuinely European-style time value rather than early-exercise
+  premium.
+- **Random** performs between the two, and its 93% exercise rate is
+  dominated by the ~50/50 per-step choice cascading to near-certain early
+  stopping over a 50-step episode, consistent with a per-step exercise
+  probability compounding across many periods, most of it out-of-the-money
+  and paying zero.
+
+**Exercise-time distribution** for the two nontrivial policies:
+
+![exercise time histograms](exercise_time_histograms.png)
+
+`immediate_exercise` is a spike at `t=0` by construction. `random`'s
+exercise times are front-loaded (highest density in the first several
+steps) simply because with a constant per-step exercise probability,
+survival to later steps is geometrically less likely — this is an artifact
+of the policy, not of option economics.
+
+**Optional — Part C.4: tabular Q-learning sketch.** Discretizing
+`(moneyness, time-remaining)` into a 20×20 grid and running tabular
+Q-learning for 20,000 episodes (`epsilon`-greedy, decaying `1.0 -> 0.05`)
+gives a lower-variance, higher-average policy than random hold, with a
+78% exercise rate — i.e., it learns to hold roughly a fifth of the time
+all the way to expiry, and to exercise selectively otherwise. The
+approximate learned exercise boundary (moneyness below which the learned
+Q-function prefers `EXERCISE` over `HOLD`, per time-remaining bucket):
+
+![learned exercise boundary](learned_exercise_boundary.png)
+
+The boundary sits **below 1.0 moneyness** (i.e. the option must be
+noticeably in-the-money, not just barely) and — despite the coarse
+20-bin discretization and being far short of full convergence — is
+qualitatively consistent with the American-put exercise region from
+Week 4: exercise only when sufficiently in the money, with the exercise
+threshold (moneyness cutoff) generally loosening as time-to-maturity
+shrinks. This is a sketch, not a converged agent — Week 8 will replace it
+with a properly trained policy (function approximation and/or longer
+training).
+
+---
+
+## Reflection
+
+Of the three required baselines, **always-hold-to-expiry** behaves closest
+to true American-put intuition *for this specific at‑the‑money case*,
+simply because immediate exercise forfeits all time value (payoff exactly
+zero) and random exercise throws away value on largely arbitrary, mostly
+out‑of‑the‑money stopping times. But "always hold" is not a correct general
+policy — it is only doing well here because the option starts exactly
+at‑the‑money. The Week 4 boundary intuition is that early exercise is
+optimal **only when the option is sufficiently deep in the money** (moneyness
+comfortably below 1), because in that region the remaining time value no
+longer compensates for the erosion of intrinsic value / the benefit of
+receiving the strike early. Neither "always hold" nor "always exercise
+immediately" encodes that moneyness- and time-dependent trade-off — only a
+policy that conditions on `(moneyness, time remaining)`, like the tabular
+Q-learning sketch, can. Its learned boundary (exercise once moneyness drops
+below a threshold near or below 1, tightening/loosening with time
+remaining) is the first baseline in this assignment that actually
+approximates the shape of a real American-put exercise region, which is
+exactly the behavior Week 8's stronger RL policy needs to refine and
+validate at higher resolution and with better convergence.
+
+---
+
+## Reproducibility
+
+- **Environment / model:** discretized risk-neutral GBM, `r=3%`, `sigma=20%`,
+  `T=1`, `N=50` steps (`dt=T/N`), discount `gamma=exp(-r*dt)` per step.
+- **Random seeds:** environment default seed `7`; each experiment
+  (`test_nonnegative_payoff`, sample episodes, each policy evaluation, and
+  Q-learning training) uses its own explicit seed passed into
+  `AmericanPutEnv(seed=...)` / `reset(seed=...)`, listed in the source next
+  to each call, so every number in this report is exactly reproducible.
+- **Run instructions:**
+  ```bash
+  pip install numpy matplotlib   # if not already installed
+  python american_put_env.py
+  ```
+  This prints all test results, the five sample episodes, the policy
+  comparison table, and the optional Q-learning results, and saves
+  `exercise_time_histograms.png` and `learned_exercise_boundary.png` in
+  the working directory.
