@@ -1,0 +1,56 @@
+"""
+Cox-Ross-Rubinstein binomial American put pricer.
+
+Standalone reproduction of the Week 4 benchmark, built on the SAME
+parameters as the Week 7/8 RL environment (S0, K, r, sigma, T, N) so the
+comparison in Part B.4 is apples-to-apples: same number of exercise
+opportunities N, same risk-neutral drift/vol.
+"""
+import numpy as np
+
+
+def crr_american_put(S0, K, r, sigma, T, N):
+    """
+    Returns (price, exercise_boundary) where exercise_boundary[j] is the
+    highest stock price at step j (0..N) at which early exercise is
+    optimal on the tree (np.nan if none in the money at that step).
+    """
+    dt = T / N
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1.0 / u
+    disc = np.exp(-r * dt)
+    p = (np.exp(r * dt) - d) / (u - d)
+    if not (0.0 < p < 1.0):
+        raise ValueError(f"Risk-neutral probability out of (0,1): p={p:.4f}. "
+                          f"Reduce dt (increase N) or check r, sigma.")
+
+    # terminal stock prices: S0 * u^(N-i) * d^i, i=0..N
+    i = np.arange(N + 1)
+    ST = S0 * (u ** (N - i)) * (d ** i)
+    values = np.maximum(K - ST, 0.0)
+
+    boundary = np.full(N + 1, np.nan)
+    # boundary at maturity: any ST <= K is "exercise" (trivial, forced)
+    itm = ST[values > 0]
+    boundary[N] = itm.max() if itm.size else np.nan
+
+    for j in range(N - 1, -1, -1):
+        values = disc * (p * values[:-1] + (1 - p) * values[1:])
+        i = np.arange(j + 1)
+        S = S0 * (u ** (j - i)) * (d ** i)
+        intrinsic = np.maximum(K - S, 0.0)
+        exercise_now = intrinsic > values
+        values = np.maximum(values, intrinsic)
+        if exercise_now.any():
+            boundary[j] = S[exercise_now].max()
+
+    return float(values[0]), boundary
+
+
+if __name__ == "__main__":
+    price, boundary = crr_american_put(S0=100, K=100, r=0.03, sigma=0.20, T=1.0, N=50)
+    print(f"CRR American put price: {price:.4f}")
+    print("Exercise boundary (S* below which exercise is optimal) by step:")
+    for j, b in enumerate(boundary):
+        if not np.isnan(b):
+            print(f"  step {j:2d}: S* = {b:.2f}")
