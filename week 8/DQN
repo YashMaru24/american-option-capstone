@@ -1,0 +1,221 @@
+"""
+A small, dependency-free DQN implementation (NumPy only).
+
+Why NumPy instead of PyTorch: this sandbox has no GPU and no cached
+PyTorch wheel; a cold `pip install torch` pulls ~2GB of CUDA packages
+over a metered connection, which is neither necessary nor reliable for a
+2-input, 2-action, single-hidden-layer network. Everything a DQN needs
+(replay buffer, target network, epsilon-greedy schedule, minibatch SGD/Adam
+on an MLP) is implemented explicitly below so every gradient step is
+visible and auditable rather than hidden inside a framework.
+
+Network: 2 (state) -> 64 -> 64 -> 2 (Q-values for HOLD, EXERCISE), ReLU
+hidden activations, linear output, trained with Adam on the standard DQN
+TD-target loss using a periodically-synced target network.
+"""
+import numpy as np
+from collections import deque
+
+
+# ----------------------------------------------------------------------
+# Minimal MLP with manual forward/backward + Adam
+# ----------------------------------------------------------------------
+
+class QNetwork:
+    def __init__(self, in_dim=2, hidden=64, out_dim=2, seed=0):
+        rng = np.random.default_rng(seed)
+        # He init for ReLU layers
+        self.W1 = rng.normal(0, np.sqrt(2 / in_dim), (in_dim, hidden))
+        self.b1 = np.zeros(hidden)
+        self.W2 = rng.normal(0, np.sqrt(2 / hidden), (hidden, hidden))
+        self.b2 = np.zeros(hidden)
+        self.W3 = rng.normal(0, np.sqrt(2 / hidden), (hidden, out_dim))
+        self.b3 = np.zeros(out_dim)
+        self.params = ["W1", "b1", "W2", "b2", "W3", "b3"]
+
+    def forward(self, X, cache=False):
+        z1 = X @ self.W1 + self.b1
+        a1 = np.maximum(z1, 0)
+        z2 = a1 @ self.W2 + self.b2
+        a2 = np.maximum(z2, 0)
+        z3 = a2 @ self.W3 + self.b3  # linear output = Q-values
+        if cache:
+            return z3, (X, z1, a1, z2, a2)
+        return z3
+
+    def backward(self, dOut, cache):
+        X, z1, a1, z2, a2 = cache
+        n = X.shape[0]
+        dW3 = a2.T @ dOut / n
+        db3 = dOut.mean(axis=0)
+        da2 = dOut @ self.W3.T
+        dz2 = da2 * (z2 > 0)
+        dW2 = a1.T @ dz2 / n
+        db2 = dz2.mean(axis=0)
+        da1 = dz2 @ self.W2.T
+        dz1 = da1 * (z1 > 0)
+        dW1 = X.T @ dz1 / n
+        db1 = dz1.mean(axis=0)
+        return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3}
+
+    def copy_from(self, other):
+        for p in self.params:
+            setattr(self, p, getattr(other, p).copy())
+
+
+class Adam:
+    """Standard Adam optimizer applied to a dict of named parameters."""
+    def __init__(self, net: QNetwork, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.net = net
+        self.lr = lr
+        self.b1, self.b2, self.eps = beta1, beta2, eps
+        self.m = {p: np.zeros_like(getattr(net, p)) for p in net.params}
+        self.v = {p: np.zeros_like(getattr(net, p)) for p in net.params}
+        self.t = 0
+
+    def step(self, grads):
+        self.t += 1
+        for p in self.net.params:
+            g = grads[p]
+            self.m[p] = self.b1 * self.m[p] + (1 - self.b1) * g
+            self.v[p] = self.b2 * self.v[p] + (1 - self.b2) * (g * g)
+            m_hat = self.m[p] / (1 - self.b1 ** self.t)
+            v_hat = self.v[p] / (1 - self.b2 ** self.t)
+            update = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            setattr(self.net, p, getattr(self.net, p) - update)
+
+
+# ----------------------------------------------------------------------
+# Replay buffer
+# ----------------------------------------------------------------------
+
+class ReplayBuffer:
+    def __init__(self, capacity=50_000, seed=0):
+        self.buf = deque(maxlen=capacity)
+        self.rng = np.random.default_rng(seed)
+
+    def add(self, s, a, r, s2, done):
+        self.buf.append((s, a, r, s2, done))
+
+    def sample(self, batch_size):
+        idx = self.rng.integers(0, len(self.buf), size=batch_size)
+        S, A, R, S2, D = zip(*(self.buf[i] for i in idx))
+        return (np.array(S, dtype=np.float64), np.array(A, dtype=np.int64),
+                np.array(R, dtype=np.float64), np.array(S2, dtype=np.float64),
+                np.array(D, dtype=np.float64))
+
+    def __len__(self):
+        return len(self.buf)
+
+
+# ----------------------------------------------------------------------
+# DQN training loop
+# ----------------------------------------------------------------------
+
+def linear_epsilon(episode, n_episodes, eps_start=1.0, eps_end=0.05, decay_frac=0.6):
+    """Linear decay over EPISODES (not steps) — robust to the fact that
+    average episode length itself changes as the policy improves, which
+    made a step-based budget estimate unreliable in practice."""
+    decay_episodes = decay_frac * n_episodes
+    frac = min(1.0, episode / max(1, decay_episodes))
+    return eps_start + frac * (eps_end - eps_start)
+
+
+def train_dqn(env_ctor, n_episodes=4000, gamma=None, lr=1e-3, batch_size=64,
+              buffer_capacity=50_000, train_every=4, target_sync_every=500,
+              min_buffer=500, eps_start=1.0, eps_end=0.05, eps_decay_frac=0.6,
+              seed=0, hidden=64, verbose_every=500, reward_scale=1.0,
+              double_dqn=True):
+    """
+    env_ctor: zero-arg callable returning a fresh AmericanPutEnv-like env.
+    reward_scale: rewards (and TD targets) are divided by this constant
+              purely to keep the loss surface well-scaled for Adam; a
+              positive constant rescaling of Q everywhere leaves argmax_a
+              Q(s,a) — the induced policy — unaffected. Evaluation always
+              uses the real (unscaled) environment rewards.
+    double_dqn: if True, select the bootstrap action with the online
+              network and evaluate it with the target network (Double DQN)
+              to reduce max-over-target-Q overestimation bias.
+    Returns: trained QNetwork, and a log dict of hyperparameters + curve.
+    """
+    env = env_ctor()
+    if gamma is None:
+        gamma = env.gamma
+
+    online = QNetwork(in_dim=2, hidden=hidden, out_dim=2, seed=seed)
+    target = QNetwork(in_dim=2, hidden=hidden, out_dim=2, seed=seed)
+    target.copy_from(online)
+    opt = Adam(online, lr=lr)
+    buffer = ReplayBuffer(capacity=buffer_capacity, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+
+    global_step = 0
+    ep_returns = []
+    losses = []
+
+    for ep in range(n_episodes):
+        obs = env.reset(seed=seed + 10_000 + ep)
+        done = False
+        ep_return = 0.0
+        ep_disc = 1.0
+        eps = linear_epsilon(ep, n_episodes, eps_start, eps_end, eps_decay_frac)
+        while not done:
+            if rng.random() < eps:
+                action = int(rng.integers(0, 2))
+            else:
+                q = online.forward(obs[None, :])[0]
+                action = int(np.argmax(q))
+
+            next_obs, reward, done, info = env.step(action)
+            buffer.add(obs, action, reward, next_obs, float(done))
+            ep_return += ep_disc * reward
+            ep_disc *= gamma
+            obs = next_obs
+            global_step += 1
+
+            if len(buffer) >= min_buffer and global_step % train_every == 0:
+                S, A, R, S2, D = buffer.sample(batch_size)
+                Rs = R / reward_scale
+                if double_dqn:
+                    a_star = np.argmax(online.forward(S2), axis=1)
+                    q_next_target = target.forward(S2)
+                    max_q_next = q_next_target[np.arange(len(a_star)), a_star]
+                else:
+                    max_q_next = target.forward(S2).max(axis=1)
+                y = Rs + gamma * (1 - D) * max_q_next  # TD target (scaled)
+
+                q_pred, cache = online.forward(S, cache=True)
+                q_sa = q_pred[np.arange(len(A)), A]
+                td_error = q_sa - y
+                losses.append(float(np.mean(td_error ** 2)))
+
+                dOut = np.zeros_like(q_pred)
+                dOut[np.arange(len(A)), A] = 2 * td_error / len(A)
+                grads = online.backward(dOut, cache)
+                opt.step(grads)
+
+            if global_step % target_sync_every == 0:
+                target.copy_from(online)
+
+        ep_returns.append(ep_return)
+        if verbose_every and (ep + 1) % verbose_every == 0:
+            recent = np.mean(ep_returns[-verbose_every:])
+            recent_loss = np.mean(losses[-200:]) if losses else float("nan")
+            print(f"  episode {ep+1:5d}/{n_episodes}  eps={eps:.3f}  "
+                  f"avg_return(last {verbose_every})={recent:.4f}  "
+                  f"avg_td_loss={recent_loss:.5f}")
+
+    log = dict(n_episodes=n_episodes, gamma=gamma, lr=lr, batch_size=batch_size,
+               buffer_capacity=buffer_capacity, train_every=train_every,
+               target_sync_every=target_sync_every, min_buffer=min_buffer,
+               eps_start=eps_start, eps_end=eps_end, eps_decay_frac=eps_decay_frac,
+               seed=seed, hidden=hidden, reward_scale=reward_scale,
+               double_dqn=double_dqn, ep_returns=ep_returns, losses=losses)
+    return online, log
+
+
+def dqn_policy_factory(net: QNetwork):
+    def policy(obs, env, rng):
+        q = net.forward(obs[None, :])[0]
+        return int(np.argmax(q))
+    return policy
